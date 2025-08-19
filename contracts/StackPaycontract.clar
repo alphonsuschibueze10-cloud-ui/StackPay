@@ -297,3 +297,71 @@
     (var-set btc-stx-rate new-rate)
     (print {event: "btc-rate-updated", new-rate: new-rate})
     (ok true)))
+
+;; read only functions
+
+;; Get invoice details
+(define-read-only (get-invoice (invoice-id uint))
+  (map-get? invoices invoice-id))
+
+;; Get payroll cycle details
+(define-read-only (get-payroll-cycle (cycle-id uint))
+  (map-get? payroll-cycles cycle-id))
+
+;; Get payroll entry details
+(define-read-only (get-payroll-entry (cycle-id uint) (employee principal))
+  (map-get? payroll-entries {cycle-id: cycle-id, employee: employee}))
+
+;; Get payment receipt
+(define-read-only (get-payment-receipt (receipt-id uint))
+  (map-get? payment-receipts receipt-id))
+
+;; Get user role
+(define-read-only (get-user-role (user principal))
+  (map-get? user-roles user))
+
+;; Get user permissions
+(define-read-only (get-user-permissions (user principal))
+  (map-get? user-permissions user))
+
+;; Get current BTC rate
+(define-read-only (get-btc-rate)
+  (var-get btc-stx-rate))
+
+;; Convert BTC amount to STX
+(define-read-only (btc-to-stx (amount-btc uint))
+  (/ (* amount-btc (var-get btc-stx-rate)) u100000000))
+
+;; Get platform fee for amount
+(define-read-only (get-platform-fee (amount uint))
+  (/ (* amount (var-get platform-fee-rate)) u10000))
+
+;; Check if user can create invoices
+(define-read-only (can-create-invoice (user principal))
+  (match (map-get? user-permissions user)
+    permissions (get can-create-invoice permissions)
+    false))
+
+;; Check if user can approve
+(define-read-only (can-approve (user principal))
+  (match (map-get? user-permissions user)
+    permissions (get can-approve permissions)
+    false))
+
+;; Check if user can manage payroll
+(define-read-only (can-manage-payroll (user principal))
+  (match (map-get? user-permissions user)
+    permissions (get can-manage-payroll permissions)
+    false))
+
+;; Get total invoices created
+(define-read-only (get-total-invoices)
+  (- (var-get next-invoice-id) u1))
+
+;; Get total payroll cycles created
+(define-read-only (get-total-payroll-cycles)
+  (- (var-get next-payroll-id) u1))
+
+;; Get total receipts created
+(define-read-only (get-total-receipts)
+  (- (var-get next-receipt-id) u1))
