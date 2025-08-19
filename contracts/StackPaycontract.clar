@@ -134,7 +134,7 @@
       description: description,
       due-date: due-date,
       status: status-pending,
-      created-at: block-height,
+      created-at: stacks-block-height,
       paid-at: none,
       tx-hash: none
     })
@@ -169,8 +169,8 @@
     ;; Update invoice status
     (map-set invoices invoice-id (merge invoice {
       status: status-paid,
-      paid-at: (some block-height),
-      tx-hash: (some tx-id)
+      paid-at: (some stacks-block-height),
+      tx-hash: none
     }))
     
     ;; Create payment receipt
@@ -181,8 +181,8 @@
       amount-btc: (get amount-btc invoice),
       payment-type: "invoice",
       reference-id: invoice-id,
-      timestamp: block-height,
-      block-height: block-height
+      timestamp: stacks-block-height,
+      block-height: stacks-block-height
     })
     (var-set next-receipt-id (+ receipt-id u1))
     
@@ -204,7 +204,7 @@
       total-amount-btc: u0,
       total-amount-stx: u0,
       status: status-pending,
-      created-at: block-height,
+      created-at: stacks-block-height,
       processed-at: none
     })
     (var-set next-payroll-id (+ cycle-id u1))
@@ -246,7 +246,7 @@
     
     (map-set payroll-cycles cycle-id (merge cycle {
       status: status-approved,
-      processed-at: (some block-height)
+      processed-at: (some stacks-block-height)
     }))
     
     (print {event: "payroll-processed", cycle-id: cycle-id})
@@ -270,8 +270,8 @@
     ;; Update entry status
     (map-set payroll-entries {cycle-id: cycle-id, employee: employee} (merge entry {
       status: status-paid,
-      paid-at: (some block-height),
-      tx-hash: (some tx-id)
+      paid-at: (some stacks-block-height),
+      tx-hash: none
     }))
     
     ;; Create payment receipt
@@ -282,8 +282,8 @@
       amount-btc: (get amount-btc entry),
       payment-type: "payroll",
       reference-id: cycle-id,
-      timestamp: block-height,
-      block-height: block-height
+      timestamp: stacks-block-height,
+      block-height: stacks-block-height
     })
     (var-set next-receipt-id (+ receipt-id u1))
     
@@ -365,3 +365,22 @@
 ;; Get total receipts created
 (define-read-only (get-total-receipts)
   (- (var-get next-receipt-id) u1))
+
+;; private functions
+
+;; Calculate net amount after platform fee
+(define-private (calculate-net-amount (gross-amount uint))
+  (let ((fee (/ (* gross-amount (var-get platform-fee-rate)) u10000)))
+    (- gross-amount fee)))
+
+;; Validate user permissions for action
+(define-private (validate-permissions (user principal) (required-permission (string-ascii 32)))
+  (let ((permissions (default-to {can-create-invoice: false, can-approve: false, can-manage-payroll: false}
+                                 (map-get? user-permissions user))))
+    (if (is-eq required-permission "create-invoice")
+        (get can-create-invoice permissions)
+        (if (is-eq required-permission "approve")
+            (get can-approve permissions)
+            (if (is-eq required-permission "manage-payroll")
+                (get can-manage-payroll permissions)
+                false)))))
