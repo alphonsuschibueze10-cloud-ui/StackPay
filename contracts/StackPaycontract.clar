@@ -101,3 +101,199 @@
   auto-approve-threshold: uint, ;; Auto-approve invoices below this amount
   payroll-frequency: uint ;; Days between payroll cycles
 })
+
+
+;; public functions
+
+;; Initialize user with role and permissions
+(define-public (initialize-user (user principal) (role uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= role role-employee) err-invalid-role)
+    (map-set user-roles user role)
+    (map-set user-permissions user 
+      {
+        can-create-invoice: (or (is-eq role role-admin) (is-eq role role-manager)),
+        can-approve: (or (is-eq role role-admin) (is-eq role role-manager)),
+        can-manage-payroll: (or (is-eq role role-admin) (is-eq role role-manager))
+      })
+    (ok true)))
+
+;; Create new invoice
+(define-public (create-invoice (recipient principal) (amount-btc uint) (description (string-ascii 256)) (due-date uint))
+  (let ((invoice-id (var-get next-invoice-id))
+        (permissions (unwrap! (map-get? user-permissions tx-sender) err-unauthorized))
+        (amount-stx (/ (* amount-btc (var-get btc-stx-rate)) u100000000))) ;; Convert satoshis to STX
+    (asserts! (get can-create-invoice permissions) err-unauthorized)
+    (asserts! (> amount-btc u0) err-invalid-amount)
+    (map-set invoices invoice-id {
+      issuer: tx-sender,
+      recipient: recipient,
+      amount-btc: amount-btc,
+      amount-stx: amount-stx,
+      description: description,
+      due-date: due-date,
+      status: status-pending,
+      created-at: block-height,
+      paid-at: none,
+      tx-hash: none
+    })
+    (var-set next-invoice-id (+ invoice-id u1))
+    (print {event: "invoice-created", invoice-id: invoice-id, recipient: recipient, amount-btc: amount-btc})
+    (ok invoice-id)))
+
+;; Approve invoice
+(define-public (approve-invoice (invoice-id uint))
+  (let ((invoice (unwrap! (map-get? invoices invoice-id) err-not-found))
+        (permissions (unwrap! (map-get? user-permissions tx-sender) err-unauthorized)))
+    (asserts! (get can-approve permissions) err-unauthorized)
+    (asserts! (is-eq (get status invoice) status-pending) err-invalid-status)
+    (map-set invoices invoice-id (merge invoice {status: status-approved}))
+    (print {event: "invoice-approved", invoice-id: invoice-id})
+    (ok true)))
+
+;; Pay invoice
+(define-public (pay-invoice (invoice-id uint))
+  (let ((invoice (unwrap! (map-get? invoices invoice-id) err-not-found))
+        (amount (get amount-stx invoice))
+        (platform-fee (/ (* amount (var-get platform-fee-rate)) u10000))
+        (net-amount (- amount platform-fee))
+        (receipt-id (var-get next-receipt-id)))
+    (asserts! (is-eq (get status invoice) status-approved) err-invalid-status)
+    (asserts! (is-eq tx-sender (get recipient invoice)) err-unauthorized)
+    
+    ;; Transfer STX payment
+    (try! (stx-transfer? net-amount tx-sender (get issuer invoice)))
+    (try! (stx-transfer? platform-fee tx-sender contract-owner))
+    
+    ;; Update invoice status
+    (map-set invoices invoice-id (merge invoice {
+      status: status-paid,
+      paid-at: (some block-height),
+      tx-hash: (some tx-id)
+    }))
+    
+    ;; Create payment receipt
+    (map-set payment-receipts receipt-id {
+      payer: tx-sender,
+      recipient: (get issuer invoice),
+      amount-stx: net-amount,
+      amount-btc: (get amount-btc invoice),
+      payment-type: "invoice",
+      reference-id: invoice-id,
+      timestamp: block-height,
+      block-height: block-height
+    })
+    (var-set next-receipt-id (+ receipt-id u1))
+    
+    (print {event: "invoice-paid", invoice-id: invoice-id, amount: net-amount, receipt-id: receipt-id})
+    (ok receipt-id)))
+
+;; Create payroll cycle
+(define-public (create-payroll-cycle (cycle-name (string-ascii 64)) (start-date uint) (end-date uint))
+  (let ((cycle-id (var-get next-payroll-id))
+        (permissions (unwrap! (map-get? user-permissions tx-sender) err-unauthorized)))
+    (asserts! (get can-manage-payroll permissions) err-unauthorized)
+    (asserts! (> end-date start-date) err-invalid-cycle)
+    
+    (map-set payroll-cycles cycle-id {
+      creator: tx-sender,
+      cycle-name: cycle-name,
+      start-date: start-date,
+      end-date: end-date,
+      total-amount-btc: u0,
+      total-amount-stx: u0,
+      status: status-pending,
+      created-at: block-height,
+      processed-at: none
+    })
+    (var-set next-payroll-id (+ cycle-id u1))
+    (print {event: "payroll-cycle-created", cycle-id: cycle-id, cycle-name: cycle-name})
+    (ok cycle-id)))
+
+;; Add employee to payroll cycle
+(define-public (add-payroll-entry (cycle-id uint) (employee principal) (amount-btc uint))
+  (let ((cycle (unwrap! (map-get? payroll-cycles cycle-id) err-not-found))
+        (permissions (unwrap! (map-get? user-permissions tx-sender) err-unauthorized))
+        (amount-stx (/ (* amount-btc (var-get btc-stx-rate)) u100000000)))
+    (asserts! (get can-manage-payroll permissions) err-unauthorized)
+    (asserts! (is-eq (get status cycle) status-pending) err-invalid-status)
+    (asserts! (> amount-btc u0) err-invalid-amount)
+    
+    (map-set payroll-entries {cycle-id: cycle-id, employee: employee} {
+      amount-btc: amount-btc,
+      amount-stx: amount-stx,
+      status: status-pending,
+      paid-at: none,
+      tx-hash: none
+    })
+    
+    ;; Update cycle totals
+    (map-set payroll-cycles cycle-id (merge cycle {
+      total-amount-btc: (+ (get total-amount-btc cycle) amount-btc),
+      total-amount-stx: (+ (get total-amount-stx cycle) amount-stx)
+    }))
+    
+    (print {event: "payroll-entry-added", cycle-id: cycle-id, employee: employee, amount-btc: amount-btc})
+    (ok true)))
+
+;; Process payroll cycle
+(define-public (process-payroll (cycle-id uint))
+  (let ((cycle (unwrap! (map-get? payroll-cycles cycle-id) err-not-found))
+        (permissions (unwrap! (map-get? user-permissions tx-sender) err-unauthorized)))
+    (asserts! (get can-manage-payroll permissions) err-unauthorized)
+    (asserts! (is-eq (get status cycle) status-pending) err-invalid-status)
+    
+    (map-set payroll-cycles cycle-id (merge cycle {
+      status: status-approved,
+      processed-at: (some block-height)
+    }))
+    
+    (print {event: "payroll-processed", cycle-id: cycle-id})
+    (ok true)))
+
+;; Pay individual payroll entry
+(define-public (pay-payroll-entry (cycle-id uint) (employee principal))
+  (let ((entry (unwrap! (map-get? payroll-entries {cycle-id: cycle-id, employee: employee}) err-not-found))
+        (cycle (unwrap! (map-get? payroll-cycles cycle-id) err-not-found))
+        (amount (get amount-stx entry))
+        (platform-fee (/ (* amount (var-get platform-fee-rate)) u10000))
+        (net-amount (- amount platform-fee))
+        (receipt-id (var-get next-receipt-id)))
+    (asserts! (is-eq (get status cycle) status-approved) err-invalid-status)
+    (asserts! (is-eq (get status entry) status-pending) err-invalid-status)
+    
+    ;; Transfer STX payment
+    (try! (stx-transfer? net-amount tx-sender employee))
+    (try! (stx-transfer? platform-fee tx-sender contract-owner))
+    
+    ;; Update entry status
+    (map-set payroll-entries {cycle-id: cycle-id, employee: employee} (merge entry {
+      status: status-paid,
+      paid-at: (some block-height),
+      tx-hash: (some tx-id)
+    }))
+    
+    ;; Create payment receipt
+    (map-set payment-receipts receipt-id {
+      payer: tx-sender,
+      recipient: employee,
+      amount-stx: net-amount,
+      amount-btc: (get amount-btc entry),
+      payment-type: "payroll",
+      reference-id: cycle-id,
+      timestamp: block-height,
+      block-height: block-height
+    })
+    (var-set next-receipt-id (+ receipt-id u1))
+    
+    (print {event: "payroll-paid", cycle-id: cycle-id, employee: employee, amount: net-amount, receipt-id: receipt-id})
+    (ok receipt-id)))
+
+;; Update BTC/STX exchange rate
+(define-public (update-btc-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set btc-stx-rate new-rate)
+    (print {event: "btc-rate-updated", new-rate: new-rate})
+    (ok true)))
